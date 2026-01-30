@@ -29,11 +29,160 @@ const CONFIG_PATH = path.join(__dirname, "multi_configs.json");
 const WEBHOOK_CONFIG_PATH = path.join(__dirname, "webhook_config.json");
 const PREFIX_CONFIG_PATH = path.join(__dirname, "package_prefix_config.json");
 const ACTIVITY_CONFIG_PATH = path.join(__dirname, "activity_config.json");
+const DISCORD_BOT_CONFIG_PATH = path.join(__dirname, "discord_bot_config.json");
 const util = require("util");
 const figlet = require("figlet");
 const _boxen = require("boxen");
 const boxen = _boxen.default || _boxen;
 const screenshot = require("screenshot-desktop");
+const { Client, GatewayIntentBits } = require("discord.js");
+
+class DiscordHeartbeatManager {
+  constructor({ token, channelId }) {
+    this.channelId = channelId;
+    this.lastSeen = new Map();
+    this.isReady = false;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 5;
+
+    this.client = new Client({
+      intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+      ],
+    });
+
+    this.client.on("ready", () => {
+      console.log(`✅ Discord Bot đã kết nối: ${this.client.user.tag}`);
+      this.isReady = true;
+      this.reconnectAttempts = 0;
+    });
+
+    this.client.on("messageCreate", (msg) => {
+      if (msg.author.bot) return;
+      if (msg.channel.id !== this.channelId) return;
+
+      const username = msg.content.trim();
+      if (!/^[a-zA-Z0-9_]+$/.test(username)) return;
+
+      this.lastSeen.set(username, Date.now());
+      console.log(`💓 Heartbeat nhận từ: ${username} (${new Date().toLocaleTimeString()})`);
+    });
+
+    this.client.on("error", (error) => {
+      console.error(`❌ Discord Bot lỗi: ${error.message}`);
+    });
+
+    this.client.on("disconnect", () => {
+      console.warn(`⚠️ Discord Bot mất kết nối`);
+      this.isReady = false;
+      this.attemptReconnect();
+    });
+
+    if (token && token.trim()) {
+      this.login(token);
+    } else {
+      console.warn("⚠️ Không có Discord Bot Token - Heartbeat sẽ không hoạt động");
+    }
+  }
+
+  async login(token) {
+    try {
+      await this.client.login(token);
+    } catch (error) {
+      console.error(`❌ Không thể đăng nhập Discord Bot: ${error.message}`);
+      this.isReady = false;
+    }
+  }
+
+  async attemptReconnect() {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error(`❌ Đã thử kết nối lại ${this.maxReconnectAttempts} lần. Bỏ qua heartbeat.`);
+      return;
+    }
+
+    this.reconnectAttempts++;
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+    console.log(`🔄 Thử kết nối lại Discord Bot (lần ${this.reconnectAttempts}/${this.maxReconnectAttempts}) sau ${delay/1000}s...`);
+    
+    await new Promise(resolve => setTimeout(resolve, delay));
+    
+    try {
+      const botConfig = Utils.loadDiscordBotConfig();
+      if (botConfig && botConfig.token) {
+        await this.client.login(botConfig.token);
+      }
+    } catch (error) {
+      console.error(`❌ Kết nối lại thất bại: ${error.message}`);
+      this.attemptReconnect();
+    }
+  }
+
+  isAlive(username, timeoutMs = 5 * 60 * 1000) {
+    if (!this.isReady) {
+      console.warn(`⚠️ Discord Bot chưa sẵn sàng - bỏ qua kiểm tra heartbeat cho ${username}`);
+      return true;
+    }
+
+    const last = this.lastSeen.get(username);
+    if (!last) {
+      console.warn(`⚠️ Chưa nhận heartbeat từ ${username}`);
+      return false;
+    }
+    
+    const isAlive = Date.now() - last <= timeoutMs;
+    if (!isAlive) {
+      const minutesAgo = Math.floor((Date.now() - last) / 60000);
+      console.warn(`💀 ${username} không gửi heartbeat trong ${minutesAgo} phút`);
+    }
+    
+    return isAlive;
+  }
+
+  getLastSeenTime(username) {
+    const last = this.lastSeen.get(username);
+    if (!last) return null;
+    return new Date(last);
+  }
+
+  getHeartbeatStatus(username) {
+    if (!this.isReady) return "Bot Off ⚠️";
+    
+    const last = this.lastSeen.get(username);
+    if (!last) return "No Data 📭";
+    
+    const minutesAgo = Math.floor((Date.now() - last) / 60000);
+    if (minutesAgo < 1) return "Active 💚";
+    if (minutesAgo < 5) return `${minutesAgo}m ago 💛`;
+    return `${minutesAgo}m ago 💔`;
+  }
+
+  cleanup() {
+    if (this.client) {
+      this.client.destroy();
+      console.log("🔌 Discord Bot đã ngắt kết nối");
+    }
+  }
+}
+
+let heartbeat = null;
+
+function initializeHeartbeat() {
+  const botConfig = Utils.loadDiscordBotConfig();
+
+  if (botConfig && botConfig.token && botConfig.token.trim() && botConfig.channelId && botConfig.channelId.trim()) {
+    console.log("🤖 Đang khởi tạo Discord Heartbeat Manager...");
+    heartbeat = new DiscordHeartbeatManager({ token: botConfig.token, channelId: botConfig.channelId });
+  } else {
+    console.warn("⚠️ Discord Heartbeat không được cấu hình (thiếu token hoặc channelId trong file config)");
+    console.warn("⚠️ Heartbeat checking sẽ bị bỏ qua");
+  }
+}
+
+initializeHeartbeat();
+
+const aliveFailCount = new Map();
 
 class Utils {
   static ensureRoot() {
@@ -198,6 +347,28 @@ class Utils {
       const raw = fs.readFileSync(ACTIVITY_CONFIG_PATH);
       const config = JSON.parse(raw);
       return config.activity || null;
+    } catch {
+      return null;
+    }
+  }
+
+  static saveDiscordBotConfig(config) {
+    try {
+      fs.writeFileSync(DISCORD_BOT_CONFIG_PATH, JSON.stringify(config, null, 2));
+      console.log(`💾 Đã lưu Discord Bot config`);
+    } catch (e) {
+      console.error(`❌ Không thể lưu Discord Bot config: ${e.message}`);
+    }
+  }
+
+  static loadDiscordBotConfig() {
+    if (!fs.existsSync(DISCORD_BOT_CONFIG_PATH)) {
+      return null;
+    }
+    try {
+      const raw = fs.readFileSync(DISCORD_BOT_CONFIG_PATH);
+      const config = JSON.parse(raw);
+      return config;
     } catch {
       return null;
     }
@@ -767,8 +938,8 @@ class UIRenderer {
   static renderTitle() {
     const fallbackTitle = `
 ╔══════════════════════════════════════╗
-║        🚀  DAWN REJOIN ��           ║
-║    Bản quyền thuộc về The Real Dawn  ║
+║        🚀   ZKAY REJOIN   🚀        ║
+║      Bản quyền thuộc về ZKAY404      ║
 ╚══════════════════════════════════════╝`;
 
     try {
@@ -831,7 +1002,6 @@ class UIRenderer {
     const stats = this.getSystemStats();
     const colWidths = this.calculateOptimalColumnWidths();
 
-    // Tính toán uptime
     let uptimeText = "";
     if (startTime) {
       const uptimeMs = Date.now() - startTime;
@@ -841,15 +1011,21 @@ class UIRenderer {
       uptimeText = ` | ⏱️ Uptime: ${hours}h ${minutes}m ${seconds}s`;
     }
 
-    const cpuRamLine = `💻 CPU: ${stats.cpuUsage}% | 🧠 RAM: ${stats.ramUsage} | 🔥 Instances: ${instances.length}${uptimeText}`;
+    let heartbeatStatus = "";
+    if (heartbeat) {
+      heartbeatStatus = heartbeat.isReady ? " | 💓 Heartbeat: Active" : " | 💔 Heartbeat: Offline";
+    }
+
+    const cpuRamLine = `💻 CPU: ${stats.cpuUsage}% | 🧠 RAM: ${stats.ramUsage} | 🔥 Instances: ${instances.length}${uptimeText}${heartbeatStatus}`;
 
     const table = new Table({
-      head: ["Package", "User", "Status", "Info", "Time", "Delay"],
+      head: ["Package", "User", "Status", "Heartbeat", "Info", "Time", "Delay"],
       colWidths: [
         colWidths.package,
         colWidths.user,
         colWidths.status,
-        colWidths.info,
+        12,
+        colWidths.info - 12,
         colWidths.time,
         colWidths.delay
       ],
@@ -873,13 +1049,18 @@ class UIRenderer {
 
       const rawUsername = instance.config.username || instance.user.username || 'Unknown';
       const username = Utils.maskSensitiveInfo(rawUsername);
-
       const delaySeconds = Number(instance.countdownSeconds) || 0;
+
+      let heartbeatStatusDisplay = "N/A";
+      if (heartbeat && heartbeat.isReady) {
+        heartbeatStatusDisplay = heartbeat.getHeartbeatStatus(rawUsername);
+      }
 
       table.push([
         packageDisplay,
         username,
         instance.status,
+        heartbeatStatusDisplay,
         instance.info,
         new Date().toLocaleTimeString(),
         this.formatCountdown(delaySeconds)
@@ -962,8 +1143,8 @@ class MultiRejoinTool {
       } catch (e) {
         console.log(`
 ╔══════════════════════════════════════╗
-║        🚀   DAWN REJOIN   🚀        ║
-║    Bản quyền thuộc về The Real Dawn  ║
+║        🚀   ZKAY REJOIN   🚀        ║
+║      Bản quyền thuộc về ZKAY404      ║
 ╚══════════════════════════════════════╝`);
       }
       
@@ -971,16 +1152,16 @@ class MultiRejoinTool {
         console.log(`\nTổng lượt chạy: ${visitCount}`);
         console.log(`discord.gg/37VJXk9hH4`);
       }
-      console.log("\n🎯 Rejoin Tool");
       console.log("1. 🚀 Bắt đầu auto rejoin");
       console.log("2. ⚙️ Setup packages");
       console.log("3. ✏️ Chỉnh sửa config");
       console.log("4. 📦 Chỉnh prefix package Roblox");
       console.log("5. 🎯 Chỉnh activity Roblox");
       console.log("6. 🔗 Cấu hình webhook");
+      console.log("7. 🤖 Cấu hình Discord Bot Heartbeat");
 
       const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      const choice = await Utils.ask(rl, "\nChọn option (1-6): ");
+      const choice = await Utils.ask(rl, "\nChọn option (1-7): ");
 
       try {
         if (choice.trim() === "1") {
@@ -1000,6 +1181,9 @@ class MultiRejoinTool {
           rl.close();
         } else if (choice.trim() === "6") {
           await this.setupWebhook(rl);
+          rl.close();
+        } else if (choice.trim() === "7") {
+          await this.configureDiscordBot(rl);
           rl.close();
         } else {
           console.log("❌ Lựa chọn không hợp lệ!");
@@ -1282,7 +1466,204 @@ class MultiRejoinTool {
     await this.start();
   }
 
+  async configureDiscordBot(rl) {
+    console.clear();
+    console.log(UIRenderer.renderTitle());
+    console.log("\n🤖 Cấu hình Discord Bot Heartbeat");
+    console.log("=".repeat(50));
+    
+    const currentConfig = Utils.loadDiscordBotConfig();
+    
+    if (currentConfig) {
+      console.log(`\n📋 Cấu hình hiện tại:`);
+      console.log(`🔑 Token: ${Utils.maskSensitiveInfo(currentConfig.token)}`);
+      console.log(`📡 Channel ID: ${currentConfig.channelId}`);
+      
+      console.log("\n🎯 Chọn hành động:");
+      console.log("1. ✏️ Chỉnh sửa cấu hình");
+      console.log("2. 🔄 Khởi động lại bot");
+      console.log("3. ❌ Xóa cấu hình");
+      console.log("4. ⏭️ Quay lại menu chính");
+      
+      const choice = await Utils.ask(rl, "\nNhập lựa chọn (1-4): ");
+      
+      if (choice.trim() === "1") {
+        await this.editDiscordBotConfig(rl);
+      } else if (choice.trim() === "2") {
+        await this.restartDiscordBot(rl);
+      } else if (choice.trim() === "3") {
+        await this.deleteDiscordBotConfig(rl);
+      } else {
+        // Quay lại menu chính
+        console.log("\n⏳ Đang quay lại menu chính...");
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        await this.start();
+        return;
+      }
+    } else {
+      console.log("\n📝 Chưa có cấu hình Discord Bot!");
+      console.log("\n🎯 Chọn hành động:");
+      console.log("1. ➕ Tạo cấu hình mới");
+      console.log("2. ⏭️ Quay lại menu chính");
+      
+      const choice = await Utils.ask(rl, "\nNhập lựa chọn (1-2): ");
+      
+      if (choice.trim() === "1") {
+        await this.createDiscordBotConfig(rl);
+      } else {
+        // Quay lại menu chính
+        console.log("\n⏳ Đang quay lại menu chính...");
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        await this.start();
+        return;
+      }
+    }
+  }
 
+  async createDiscordBotConfig(rl) {
+    console.log("\n📝 Tạo cấu hình Discord Bot mới:");
+    console.log("\n💡 Hướng dẫn:");
+    console.log("1. Truy cập Discord Developer Portal: https://discord.com/developers/applications");
+    console.log("2. Tạo ứng dụng mới hoặc chọn ứng dụng có sẵn");
+    console.log("3. Vào phần 'Bot' và copy Token");
+    console.log("4. Bật các Privileged Gateway Intents: MESSAGE CONTENT");
+    console.log("5. Mời bot vào server của bạn");
+    console.log("6. Copy Channel ID nơi bot sẽ nhận heartbeat messages");
+    
+    let token;
+    while (true) {
+      token = await Utils.ask(rl, "\n🔑 Nhập Discord Bot Token: ");
+      if (token.trim()) {
+        break;
+      }
+      console.log("❌ Token không được để trống!");
+    }
+
+    let channelId;
+    while (true) {
+      channelId = await Utils.ask(rl, "📡 Nhập Channel ID: ");
+      if (channelId.trim() && /^\d+$/.test(channelId.trim())) {
+        break;
+      }
+      console.log("❌ Channel ID không hợp lệ! Phải là số.");
+    }
+
+    const config = {
+      token: token.trim(),
+      channelId: channelId.trim()
+    };
+
+    Utils.saveDiscordBotConfig(config);
+    console.log("\n✅ Đã lưu cấu hình Discord Bot!");
+    console.log("🔄 Vui lòng khởi động lại chương trình để áp dụng cấu hình.");
+    
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    
+    // Quay lại menu chính
+    console.log("\n⏳ Đang quay lại menu chính...");
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    await this.start();
+  }
+
+  async editDiscordBotConfig(rl) {
+    console.log("\n✏️ Chỉnh sửa cấu hình Discord Bot:");
+    
+    const currentConfig = Utils.loadDiscordBotConfig();
+    
+    let token;
+    while (true) {
+      console.log(`\n🔑 Token hiện tại: ${Utils.maskSensitiveInfo(currentConfig.token)}`);
+      token = await Utils.ask(rl, "Nhập Token mới (Enter để giữ nguyên): ");
+      if (!token.trim()) {
+        token = currentConfig.token;
+        break;
+      }
+      if (token.trim()) {
+        break;
+      }
+    }
+
+    let channelId;
+    while (true) {
+      console.log(`\n📡 Channel ID hiện tại: ${currentConfig.channelId}`);
+      channelId = await Utils.ask(rl, "Nhập Channel ID mới (Enter để giữ nguyên): ");
+      if (!channelId.trim()) {
+        channelId = currentConfig.channelId;
+        break;
+      }
+      if (/^\d+$/.test(channelId.trim())) {
+        break;
+      }
+      console.log("❌ Channel ID không hợp lệ! Phải là số.");
+    }
+
+    const config = {
+      token: token.trim(),
+      channelId: channelId.trim()
+    };
+
+    Utils.saveDiscordBotConfig(config);
+    console.log("\n✅ Đã cập nhật cấu hình Discord Bot!");
+    console.log("🔄 Vui lòng khởi động lại chương trình để áp dụng cấu hình mới.");
+    
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    
+    // Quay lại menu chính
+    console.log("\n⏳ Đang quay lại menu chính...");
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    await this.start();
+  }
+
+  async restartDiscordBot(rl) {
+    console.log("\n🔄 Khởi động lại Discord Bot...");
+    
+    if (heartbeat) {
+      heartbeat.cleanup();
+      heartbeat = null;
+    }
+    
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    initializeHeartbeat();
+    
+    console.log("✅ Bot đã được khởi động lại!");
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    // Quay lại menu chính
+    console.log("\n⏳ Đang quay lại menu chính...");
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    await this.start();
+  }
+
+  async deleteDiscordBotConfig(rl) {
+    console.log("\n❌ Xóa cấu hình Discord Bot:");
+    
+    const currentConfig = Utils.loadDiscordBotConfig();
+    console.log(`\n🔑 Token: ${Utils.maskSensitiveInfo(currentConfig.token)}`);
+    console.log(`📡 Channel ID: ${currentConfig.channelId}`);
+    
+    const confirm = await Utils.ask(rl, "\n⚠️ Bạn có chắc chắn muốn xóa cấu hình? (y/N): ");
+    
+    if (confirm.toLowerCase() === 'y' || confirm.toLowerCase() === 'yes') {
+      if (heartbeat) {
+        heartbeat.cleanup();
+        heartbeat = null;
+      }
+      
+      Utils.saveDiscordBotConfig(null);
+      console.log("\n✅ Đã xóa cấu hình Discord Bot!");
+      console.log("📊 Bot sẽ không hoạt động cho đến khi cấu hình lại.");
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    } else {
+      console.log("❌ Đã hủy xóa cấu hình.");
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+    
+    // Quay lại menu chính
+    console.log("\n⏳ Đang quay lại menu chính...");
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    await this.start();
+  }
 
   async startAutoRejoin(rl) {
   const configs = Utils.loadMultiConfigs();
@@ -1434,7 +1815,11 @@ async runMultiInstanceLoop() {
           presenceTypeDisplay = presence.userPresenceType.toString();
         }
 
-        const analysis = statusHandler.analyzePresence(presence, config.placeId);
+        const analysis = statusHandler.analyzePresence(
+          presence, 
+          config.placeId,
+          config.username
+        );
 
         if (analysis.shouldLaunch) {
           GameLauncher.handleGameLaunch(
@@ -1472,8 +1857,8 @@ async runMultiInstanceLoop() {
       } catch (e) {
       console.log(`
 ╔══════════════════════════════════════╗
-║        🚀   DAWN REJOIN   🚀        ║
-║    Bản quyền thuộc về The Real Dawn  ║
+║        🚀   ZKAY REJOIN   🚀        ║
+║      Bản quyền thuộc về ZKAY404      ║
 ╚══════════════════════════════════════╝`);
       }
 
@@ -1483,6 +1868,13 @@ async runMultiInstanceLoop() {
         console.log("\n🔍 Debug (Instance 1):");
         console.log(`Package: ${this.instances[0].packageName}`);
         console.log(`Last Check: ${new Date(this.instances[0].lastCheck).toLocaleTimeString()}`);
+        
+        // ADD THIS:
+        if (heartbeat && heartbeat.isReady) {
+          const username = this.instances[0].config.username;
+          const lastSeen = heartbeat.getLastSeenTime(username);
+          console.log(`Heartbeat: ${lastSeen ? lastSeen.toLocaleTimeString() : 'No data'}`);
+        }
       }
 
       // Hiển thị thông tin webhook nếu có
@@ -2056,6 +2448,11 @@ class ConfigEditor {
 // Handle graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n\n🛑 Đang dừng chương trình...');
+  
+  if (heartbeat) {
+    heartbeat.cleanup();
+  }
+  
   console.log('👋 Cảm ơn bạn đã sử dụng Dawn Rejoin Tool!');
   process.exit(0);
 });
